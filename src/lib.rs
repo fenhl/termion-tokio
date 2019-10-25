@@ -1,6 +1,3 @@
-extern crate bytes;
-extern crate futures;
-extern crate termion;
-extern crate tokio;
+#![feature(poll_map)]
 
 pub mod input;
