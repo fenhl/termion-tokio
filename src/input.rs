@@ -1,12 +1,20 @@
-use std::io::{self, Write};
-use std::iter::empty;
-use std::mem::replace;
+use std::{
+    io::{self, Write},
+    iter::empty,
+    mem::replace,
+    pin::Pin,
+    task::Context
+};
 
 use bytes::{Buf, BytesMut, IntoBuf};
-use futures::{Async, Future, Poll, Stream};
+use futures::{
+    Future,
+    Poll::{self, *},
+    Stream
+};
 use tokio::{
     codec::{Decoder, FramedRead},
-    io::AsyncRead,
+    io::AsyncRead
 };
 
 use termion::event::{self, Event, Key};
@@ -18,17 +26,18 @@ pub struct KeysStream<R> {
 }
 
 impl<R: AsyncRead> Stream for KeysStream<R> {
-    type Item = Key;
-    type Error = io::Error;
+    type Item = io::Result<Key>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        use self::Async::*;
-        self.inner.poll().map(|async| match async {
-            Ready(Some(Event::Key(k))) => Ready(Some(k)),
-            Ready(Some(_)) => NotReady,
-            Ready(None) => Ready(None),
-            NotReady => NotReady,
-        })
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
+        loop {
+            break match self.inner.poll_next(ctx) {
+                Ready(Some(Ok(Event::Key(k)))) => Ready(Some(Ok(k))),
+                Ready(Some(Ok(_))) => continue,
+                Ready(Some(Err(e))) => Ready(Some(Err(e))),
+                Ready(None) => Ready(None),
+                Pending => Pending,
+            }
+        }
     }
 }
 
@@ -38,13 +47,12 @@ pub struct EventsStream<R> {
 }
 
 impl<R: AsyncRead> Stream for EventsStream<R> {
-    type Item = Event;
-    type Error = io::Error;
+    type Item = io::Result<Event>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         self.inner
-            .poll()
-            .map(|async| async.map(|option| option.map(|(event, _raw)| event)))
+            .poll_next(ctx)
+            .map_ok(|(event, _)| event)
     }
 }
 
@@ -94,9 +102,9 @@ impl Decoder for EventsAndRawDecoder {
     }
 }
 
-fn parse_event<I>(item: u8, iter: &mut I) -> Result<(Event, Vec<u8>), io::Error>
+fn parse_event<I>(item: u8, iter: &mut I) -> io::Result<(Event, Vec<u8>)>
 where
-    I: Iterator<Item = Result<u8, io::Error>>,
+    I: Iterator<Item = io::Result<u8>>,
 {
     let mut buf = vec![item];
     let result = {
@@ -133,42 +141,37 @@ impl<R> ReadLineFuture<R> {
 }
 
 impl<R: AsyncRead> Future for ReadLineFuture<R> {
-    type Item = (Option<String>, R);
-    type Error = io::Error;
+    type Output = io::Result<(Option<String>, R)>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
         use self::ReadLineState::*;
         match replace(&mut self.0, Done) {
-            Error(error) => Err(error),
-            Read(mut buf, mut input) => {
-                use self::Async::*;
-
+            Error(error) => Ready(Err(error)),
+            Read(mut buf, mut input) => loop {
                 let mut byte = [0x8, 1];
 
-                match input.poll_read(&mut byte) {
+                match input.poll_read(ctx, &mut byte) {
                     Ok(Ready(1)) => match byte[0] {
-                        0 | 3 | 4 => return Ok(Ready((None, input))),
+                        0 | 3 | 4 => return Ready(Ok((None, input))),
                         0x7f => {
                             buf.pop();
                         }
                         b'\n' | b'\r' => {
-                            let string = try!(
-                                String::from_utf8(buf)
-                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                            );
-                            return Ok(Ready((Some(string), input)));
+                            let string = String::from_utf8(buf)
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                            return Ready(Ok((Some(string), input)));
                         }
                         c => {
                             buf.push(c);
                         }
                     },
-                    Ok(Ready(_)) => (),
-                    Ok(NotReady) => (),
-                    Err(e) => return Err(e),
+                    Ok(Ready(_)) => continue,
+                    Ok(Pending) => (),
+                    Err(e) => return Ready(Err(e)),
                 }
 
                 self.0 = Read(buf, input);
-                Ok(NotReady)
+                break Pending
             }
             Done => unreachable!(),
         }
